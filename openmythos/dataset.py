@@ -36,7 +36,7 @@ import torch.utils.data as torch_data
 
 logger = logging.getLogger("openmythos.dataset")
 
-DEFAULT_DATASET = "ProCreations/Ultra-FineWeb-EDU"
+DEFAULT_DATASET = "codelion/fineweb-edu-10M"
 
 
 # ===========================================================================
