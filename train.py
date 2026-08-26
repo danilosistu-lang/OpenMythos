@@ -92,6 +92,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--low_ram", action="store_true",
                    help="constant-RAM profile: caps shuffle buffer at 512 "
                         "docs and disables pinned-memory staging")
+    p.add_argument("--tokenize_chunk_docs", type=int, default=30,
+                   help="download-pacing gate: after every N raw documents "
+                        "the stream tokenises/packs the batch fully before "
+                        "resuming the parquet download")
+    p.add_argument("--tokenize_pause_s", type=float, default=0.05,
+                   help="timer nap (seconds) after each paced chunk; raise "
+                        "e.g. to 1.0 on very slow/small-RAM hosts")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--dist_strategy", choices=["auto", "ddp", "fsdp", "none"],
                    default="auto")
@@ -232,6 +239,8 @@ def main() -> int:
         seed=args.seed + dist.rank,
         shuffle_buffer_docs=args.shuffle_buffer_docs,
         low_ram_profile=args.low_ram,
+        tokenize_chunk_docs=args.tokenize_chunk_docs,
+        tokenize_pause_s=args.tokenize_pause_s,
     )
     eval_loader, eval_meta = get_fineweb_dataloader(
         dataset_name=args.dataset_name,
@@ -244,6 +253,8 @@ def main() -> int:
         seed=args.seed + 777 + dist.rank,
         shuffle_buffer_docs=args.shuffle_buffer_docs,
         low_ram_profile=True,   # eval never needs deep shuffling
+        tokenize_chunk_docs=args.tokenize_chunk_docs,
+        tokenize_pause_s=args.tokenize_pause_s,
     )
     if meta.demo_mode or eval_meta.demo_mode:
         log.warning("=" * 78)
