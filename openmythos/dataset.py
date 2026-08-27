@@ -404,7 +404,7 @@ def get_fineweb_dataloader(
         low_ram_profile: additionally caps the shuffle buffer at 512 docs.
         num_workers: set ``0`` to keep everything inside the main process
             (smallest possible footprint, one tokenizer instance).
-        tokenize_chunk_docs: download-pacing gate size — after every N raw
+        tokenize_chunk_docs: download-pacing gate size â after every N raw
             documents the stream fully tokenises/packs what it pulled and only
             then resumes downloading (default 30).
         tokenize_pause_s: enforced nap after each paced chunk completes; raise
