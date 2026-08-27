@@ -1,4 +1,4 @@
-OpenMythos — Recurrent-Depth Transformer (RDT)
+# OpenMythos — Recurrent-Depth Transformer (RDT)
 
 **A production-ready, runnable implementation of Recurrent-Depth Transformers
 targeting NVIDIA Blackwell (B200 / GB200) and Hopper (H100 / H200) fleets.**
@@ -28,11 +28,12 @@ tokens→ │  PRELUDE   │ → │  RECURRENT CORE (loop × T)    │ → │ 
 4. [Installation](#installation)
 5. [Quickstart](#quickstart)
 6. [Model variants](#model-variants)
-7. [Precision scaling guide (BF16 / FP8 / NVFP4)](#precision-scaling-guide)
-8. [Dataset streaming](#dataset-streaming)
-9. [Distributed training](#distributed-training)
-10. [Checkpointing & resuming](#checkpointing--resuming)
-11. [Verification suite](#verification-suite)
+7. [Precision scaling guide (BF16 / FP16 / FP8 / NVFP4)](#precision-scaling-guide)
+8. [GPU auto-tune — MFU profiles for every card](#gpu-auto-tune--mfu-profiles-for-every-card)
+9. [Dataset streaming](#dataset-streaming)
+10. [Distributed training](#distributed-training)
+11. [Checkpointing & resuming](#checkpointing--resuming)
+12. [Verification suite](#verification-suite)
 
 ---
 
@@ -126,9 +127,14 @@ openmythos/
     ├── lti_recurrent.py        # LTIRecurrentInjection (ZOH), DepthWiseLoRA
     ├── model.py                # Prelude/Recurrent/Coda + OpenMythosForCausalLM
     ├── dataset.py              # streaming FineWeb-Edu token packing pipeline
-    ├── precision.py            # bf16/fp8/fp4 contexts + Blackwell detection
+    ├── gpu_profile.py          # 61-GPU DB, auto-detection, MFU tuning profiles
+    ├── precision.py            # bf16/fp16/fp8/fp4 contexts + Blackwell detection
     └── utils.py                # param census, LR schedule, DDP/FSDP, loggers
 ```
+
+The repo also ships standalone tooling under `scripts/`: `tune_gpu.py`
+(GPU detection / MFU profiles / GEMM benchmark CLI) and
+`sync_checkpoints_to_hf.py` (background checkpoint publisher).
 
 ## Installation
 
@@ -192,7 +198,23 @@ Key CLI flags (see `--help` for the full set): `--variant`, `--dataset_name`,
 `--precision {bf16,fp8,fp4,fp32}`, `--loop_iters`, `--use_flash_attn /
 --no-use_flash_attn`, `--checkpoint_dir`, `--wandb_project`,
 plus production extras (`--resume`, `--eval_interval`, `--grad_checkpoint`,
-`--dist_strategy`, `--attn_type`, `--tokenizer_name`, …).
+`--dist_strategy`, `--attn_type`, `--tokenizer_name`,
+`--shuffle_buffer_docs`, `--low_ram`, …).
+
+On RAM-constrained hosts (< 32 GB) add `--low_ram --num_workers 2 --batch_size 2`:
+the data path stays strictly constant-RAM end to end — HF streaming pulls one
+parquet row-group at a time, the shuffle reservoir is capped at 512 documents
+and pinned-memory staging is disabled — so peak host memory is dominated by the
+model/optimizer, not the corpus.
+
+If your box still OOMs because parquet downloads outpace tokenisation, the
+stream ships a built-in **download pacing gate**: `--tokenize_chunk_docs`
+(default 30) pulls exactly N raw documents, fully tokenises + packs that batch,
+then naps `--tokenize_pause_s` seconds (default 0.05) before resuming the
+download — so buffered tokens stay bounded no matter how fast the link is. For
+pathologically slow hosts use e.g.
+`--low_ram --num_workers 1 --tokenize_pause_s 1.0`; progress and pack-buffer
+depth are logged every 50 chunks so you can watch it pace itself.
 
 ## Model variants
 
@@ -227,6 +249,7 @@ Selected via `--precision`; managed by `openmythos/precision.py`.
 |---|---|---|
 | `fp32` | Full float32; `torch.set_float32_matmul_precision('high')` enables TF32 GEMMs on Ampere+. | any |
 | `bf16` | `torch.autocast(device_type='cuda', dtype=torch.bfloat16)`. Mixed-precision reduce stats configured automatically under FSDP/NCCL. | Ampere+ recommended |
+| `fp16` | `torch.autocast(device_type='cuda', dtype=torch.float16)` with a **dynamic `GradScaler`** (auto-enabled by the trainer: losses are scaled before `backward`, gradients unscaled before clipping, `scaler.step/update` drive the optimizer). On Ampere+ a warning suggests `bf16` instead (same GEMM rate, wider mantissa). | Volta/Turing tensor cores |
 | `fp8` | Backend ladder: **Transformer Engine** delayed scaling (HYBRID E4M3/E5M2 recipes, swapped-in `te.Linear`) → **torchao.float8** `convert_to_float8_training` + autocast context → clearly logged BF16 fallback. Sensitive ops (router, latent compressor, LM head) always remain high precision. | Hopper/Blackwell for speedup; safe anywhere |
 | `fp4` | Blackwell-native **NVFP4 micro-scaled** quantisation path targeting SM100 (B200/GB200) / SM120 consumer dies: eligible linears become block-wise group-of-16 E2M1 micro-scaled ops. On non-Blackwell hardware the identical numeric contract is preserved through a portable straight-through-estimator emulation, with a one-line warning recommending `--precision fp8`. Control-plane projections are exempt. | Blackwell for native throughput |
 
@@ -244,23 +267,112 @@ with get_autocast_context("fp4"):
 `openmythos.utils.count_parameters` reports both total and *active-per-token*
 parameters so routing efficiency is visible in logs from step zero.
 
-## Dataset streaming
+## GPU auto-tune — MFU profiles for every card
 
-`get_fineweb_dataloader()` streams **HuggingFace FineWeb-Edu** with no local
-cache requirement:
+`openmythos/gpu_profile.py` ships a curated database of **61 NVIDIA GPUs** —
+Tesla P100/P40/P4, V100, T4, the GTX 16xx / RTX 20xx / 30xx / 40xx / 50xx
+consumer stacks, A-series datacenter (A100/A800/A30/A10/A40/A2), L4/L20/L40/
+L40S, RTX A/Ada workstations, H100/H200/H800/GH200/H20, and both Blackwell
+generations (B100/B200/GB300-class and RTX 50xx / RTX PRO 6000) — and turns
+the detected card into an MFU-oriented settings bundle: precision ladder,
+FlashAttention on/off, SDPA kernel priorities, batch/accumulation split sized
+from a weights+optimizer+activations memory model, dataloader workers,
+`torch.compile` advice, allocator/NCCL env tweaks and CUDA/driver gates
+(e.g. Blackwell's CUDA 12.8+ requirement). Unknown cards fall back to a
+profile synthesised from their compute capability, so nothing crashes.
 
-- `datasets.load_dataset(..., streaming=True)` plus buffer shuffling;
-- on-the-fly tokenisation via tiktoken (`gpt2` byte-level BPE by default;
-  `cl100k_base` also supported — vocab size auto-propagates into the config);
-- continuous concatenation packing into fixed `seq_len` windows (each window is
-  self-shifted for causal LM supervision);
-- automatic rank & worker sharding under `torchrun`;
-- transient network failures trigger exponential-backoff reconnects mid-stream,
-  while unresolvable cold-starts degrade into a loudly-labelled synthetic DEMO
-  corpus so pipelines never die on day zero;
-- epoch rotation reshuffles deterministically forever (the loader is endless).
+Two one-line integrations keep training honest on any silicon:
 
-Swap corpora freely: `--dataset_name HuggingFaceFW/fineweb` (or any text column
+- **`--auto_tune`** detects the GPU, applies env tweaks *before* CUDA init,
+  prints the full profile, and fills every un-set tuning flag (precision,
+  batch, accumulation, workers, flash attention, checkpointing). Explicit
+  flags always win; on hosts with no GPU it is a loud no-op.
+- The **MFU gauge** now divides by the *detected card's* dense peak for the
+  running precision instead of a hardcoded H100 constant — the `mfu/estimate`
+  logged metric is truthful from a T4 to a B300.
+
+```bash
+# inspect this host
+python scripts/tune_gpu.py                     # pretty report + launch cmd
+python scripts/tune_gpu.py --json              # machine-readable
+python scripts/tune_gpu.py --env               # eval $(... --env) in shells
+python scripts/tune_gpu.py --list              # dump the whole GPU DB
+
+# what WOULD this run look like elsewhere?
+python scripts/tune_gpu.py --simulate T4 --variant 100m
+python scripts/tune_gpu.py --simulate B300 --variant 7b
+python scripts/tune_gpu.py --simulate "cc=9.0,vram=80,sms=132"
+
+# measure real GEMM throughput vs datasheet peak (needs a GPU)
+python scripts/tune_gpu.py --bench
+
+# validate the DB + every profile anywhere (CPU-only safe)
+python scripts/tune_gpu.py --self-test         # 69/69 checks
+
+# and just train with it
+python train.py --auto_tune --variant 500m
+HF_DATASETS_OFFLINE=0 torchrun --nproc_per_node=8 train.py --auto_tune --variant 10b
+```
+
+Representative tuned outcomes (variant 500m, seq 4096):
+
+| Card | Precision | Batch × accum | FlashAttention | Notes |
+|---|---|---|---|---|
+| Tesla T4 (16 GB) | `fp16` + GradScaler | 4 × 8 | off (SDPA mem-eff.) | 65 TF fp16 TCs; 70 W |
+| RTX 3090 (24 GB) | `bf16` | 4 × 8 | FA2 | reproduces classic defaults |
+| RTX 4090 (24 GB) | `bf16` | 4 × 8 | FA2 | fp8 opt-in via TE/torchao |
+| H100 SXM (80 GB) | `bf16` (fp8 if TE) | 21 × 2 | FA2/FA3 | `mfu` vs 990 TF |
+| B300 (288 GB) | `bf16` (fp8/fp4 path) | 64 × 1 for 7b | SDPA/cuDNN | CUDA 12.8+, driver ≥ 570 |
+| RTX 5050 (8 GB) | `bf16` | 1 × 32 | off (SDPA/cuDNN) | sm_120; CUDA 12.8+ |
+
+Security/robustness notes: multi-GPU GeForce rigs automatically get
+`NCCL_P2P_DISABLE=1` (consumer cards lack reliable P2P), and every profile
+exports `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to tame
+fragmentation on small cards.
+
+## Dataset acquisition & streaming
+
+`get_fineweb_dataloader()` has two acquisition modes:
+
+**`--data_mode native` (default) — HF-native download, timeout-proof.**
+Parquet shards are pulled exactly once by `huggingface_hub` (resumable ranged
+HTTP; 302/xet-bridge redirects handled internally; concurrency-safe file
+locks), landing in the standard HF cache. Rows are then read from the *local*
+files through pyarrow row-group batches. Because no live HTTP connection is
+held while tokenisation runs, CDN read/idle timeouts during tokenizer pauses
+are structurally impossible, and downloads survive process restarts.
+
+- `--max_parquet_shards` (default 64) bounds disk usage (~100–300 MB per
+  shard); cached shards are reused across runs and shared between ranks.
+- **Any text-column corpus works**: the parquet schema is inspected and a
+  well-known text column is picked automatically (`text`, `content`, `txt`,
+  `body`, …), falling back to the first string column — e.g.
+  `ProCreations/Ultra-FineWeb-EDU` (single `content` column) needs zero
+  configuration.
+- When the shard window is consumed, its order is deterministically reshuffled
+  (endless training); raise the cap for more unique data. Rotation logs are
+  throttled, and if more readers exist than shards (e.g. 2 GPUs × 2 workers
+  over a single-shard dataset) the readers share shards via deterministic
+  row-batch striding instead of starving.
+- Works fully offline once shards are cached; `--low_ram`, the shuffle
+  reservoir (`--shuffle_buffer_docs`) and the pacing gate
+  (`--tokenize_chunk_docs/--tokenize_pause_s`) behave identically as before —
+  with native mode they pace local reads instead of live sockets.
+- Pre-mirrored corpus? Point `HF_MIRROR`-style environments or pass a local
+  directory via `get_fineweb_dataloader(local_corpus_dir=...)`.
+
+**`--data_mode stream` — legacy live reader.** The previous
+`load_dataset(..., streaming=True)` path with buffer shuffling remains for
+disk-constrained setups: on-the-fly tiktoken tokenisation, continuous packing,
+automatic rank/worker sharding under `torchrun`, exponential-backoff reconnects
+and DEMO fallback when nothing can be opened.
+
+In both modes each window of `seq_len` tokens is self-shifted for causal LM
+supervision, vocab size auto-propagates into the model config, and
+`httpx` request-level INFO logging is silenced so your console shows training
+progress rather than redirect handshakes.
+
+Swap corpora freely: `--dataset_name HuggingFaceFW/fineweb` (or any text-column
 corpus) works unchanged.
 
 ## Distributed training
@@ -287,6 +399,43 @@ python train.py --variant 1b --resume checkpoints/1b-latest.pt
 ```
 
 FSDP users should keep the same world size and strategy when resuming.
+
+## Automatic checkpoint backup to HuggingFace Hub
+
+`scripts/sync_checkpoints_to_hf.py` is a **torch-free, CPU-only daemon** that
+runs alongside training (it never blocks or slows the trainer — checkpoints are
+saved atomically by `train.py`, so the watcher can never observe partial
+files), creates your model repo on first run, and pushes weights whenever they
+actually change:
+
+```bash
+# one-time: hand the token to your shell (rotate it if it ever leaks!)
+read -s HF_TOKEN && export HF_TOKEN
+
+# launch in background, logs to sync.log
+nohup python scripts/sync_checkpoints_to_hf.py \
+    --checkpoint_dir ./checkpoints \
+    --repo_id <your-user>/openmythos-500m \
+    > sync.log 2>&1 &   echo $! > sync.pid
+```
+
+Behaviour and knobs:
+
+- scans every `--poll_interval` seconds (default 300); a file is pushed only
+  when its SHA-256 truly differs from the last pushed copy;
+- per-file cooldown via `--min_upload_interval` (default 30 min) so rapid
+  saves don't hammer the hub; dedup state survives restarts
+  (`~/.cache/openmythos_sync/`);
+- files land under `checkpoints/…` in the repo; every commit message embeds
+  the sha256 prefix + UTC timestamp; full version history lives on the hub;
+- repo is created private by default (`--public` to flip);
+- test a single cycle with `--once` (cron-friendly);
+- stop with `kill $(cat sync.pid)`.
+
+Token precedence: `--hf_token` argument → `$HF_TOKEN` → `$HUGGING_FACE_HUB_TOKEN`
+→ previously stored `huggingface-cli login`. The script never writes tokens to
+disk. If a token ever appears in chat logs, shell history or screenshots,
+revoke it at https://huggingface.co/settings/tokens immediately.
 
 ## Verification suite
 
