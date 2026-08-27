@@ -35,6 +35,9 @@ setup(
         #     pip install -r requirements.txt
         "numpy>=1.26.0",
         "tqdm>=4.66.0",
+        # Native HF shard-acquisition stack (default data path).
+        "huggingface_hub>=0.23.0",
+        "pyarrow>=14.0.0",
     ],
     extras_require={
         "data": ["datasets>=2.19.0", "tokenizers>=0.19.0", "tiktoken>=0.7.0"],
