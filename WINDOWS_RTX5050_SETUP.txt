@@ -1,0 +1,207 @@
+==============================================================================
+ OpenMythos — Windows + RTX 5050 laptop setup (100m, FP4 training)
+==============================================================================
+
+Target machine: Windows 10/11 laptop with an NVIDIA RTX 5050 (Blackwell,
+compute capability sm_120, typically 8 GB VRAM).
+
+Everything below runs in PowerShell or CMD. Commands are written on single
+lines (no backslash line continuations, which do NOT work on Windows).
+
+------------------------------------------------------------------------------
+0. Important facts before you start (please read)
+------------------------------------------------------------------------------
+
+* The RTX 5050 is a Blackwell GPU and the repo will detect it as such
+  ("FP4 (NVFP4) mode active on Blackwell hardware"). HOWEVER: the FP4 path
+  in this repository is a *numerical emulation* of NVFP4 (E2M1, group-of-16
+  micro-scaling, straight-through estimator). Master weights are NOT stored
+  in 4 bits, so FP4 here uses roughly the same VRAM as BF16 and is actually
+  *slower* (extra fake-quant ops). It exists for numeric-parity research.
+  Real NVFP4 kernel speedups on consumer Blackwell are still maturing in
+  PyTorch/torchao — when they land, this same command will pick them up.
+  If you just want the fastest practical run, use --precision bf16 instead.
+
+* flash-attn and triton do NOT ship pip-installable Windows wheels and do
+  NOT need to be installed on Windows. The code automatically falls back to
+  PyTorch's built-in SDPA attention kernel, which on Blackwell is fast.
+  transformer_engine likewise has no Windows build — it is optional and
+  only used for FP8 on H100/B200 servers.
+
+* The data pipeline does not need to download the whole corpus and does not
+  need much RAM: it streams parquet shards and tokenizes on the fly with a
+  bounded buffer (use the --low_ram flag). Even so, you can tokenize on
+  another machine entirely — see section 4.
+
+* Driver: install/refresh the latest NVIDIA Game Ready or Studio driver
+  (>= 570.x) from https://www.nvidia.com/Download/index.aspx . No separate
+  CUDA Toolkit install is needed — the PyTorch wheel below bundles CUDA 12.8
+  runtime libraries, which is what Blackwell (RTX 50-series) requires.
+
+------------------------------------------------------------------------------
+1. Install Python (one time)
+------------------------------------------------------------------------------
+
+Install Python 3.12 for Windows from https://www.python.org/downloads/windows/
+(3.12 is the best-tested wheel target for this CUDA stack; do NOT use 3.13
+ until the whole ML wheel ecosystem catches up).
+
+During install, TICK "Add python.exe to PATH".
+
+Verify in a NEW PowerShell window:
+
+    python --version
+
+Open a PowerShell window in the folder where you cloned/unzipped OpenMythos
+(e.g.  cd C:\code\OpenMythos ).
+
+------------------------------------------------------------------------------
+2. Create a virtual environment and install packages
+------------------------------------------------------------------------------
+
+    python -m venv .venv
+    .venv\Scripts\activate
+    python -m pip install --upgrade pip
+
+PyTorch with CUDA 12.8 (REQUIRED for RTX 50-series Blackwell GPUs;
+PyTorch 2.7 or newer, stable Windows wheels):
+
+    pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+(CUDA 13.0 wheels, torch 2.10+, also work if you prefer:
+    pip install torch --index-url https://download.pytorch.org/whl/cu130
+ Either channel gives sm_120 kernels for the RTX 5050.)
+
+Everything else (Windows-compatible set — note: NO flash-attn, NO triton,
+NO transformer_engine, all optional and all Linux-only):
+
+    pip install "numpy>=1.26.0" tqdm "huggingface_hub>=0.23.0" "pyarrow>=14.0.0" "datasets>=2.19.0" "tokenizers>=0.19.0" "tiktoken>=0.7.0" "transformers>=4.40.0" "accelerate>=0.30.0" wandb
+
+Optional: FP8 experiments via torchao (installs fine on Windows; fp8 will
+still fall back to bf16 autocast where kernels are unavailable — harmless):
+
+    pip install torchao
+
+Install OpenMythos itself in editable mode:
+
+    pip install -e .
+
+Verify the GPU is seen and correctly identified as Blackwell:
+
+    python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))"
+
+Expected: True, your RTX 5050, and capability (12, 0).
+
+If it prints False or capability (8, 9)/(9, 0) something is off — most often
+a CPU build of torch got installed; reinstall torch from the cu128 index URL
+above in a clean venv.
+
+------------------------------------------------------------------------------
+3. Train the 100m model in FP4
+------------------------------------------------------------------------------
+
+The 100m preset uses seq_len 2048. Recommended 8 GB-VRAM-safe command
+(low batch, heavy grad accumulation to keep effective batch large, gradient
+checkpointing for the recurrent loop, low-RAM data profile):
+
+    python train.py --variant 100m --precision fp4 --batch_size 2 --grad_accum 32 --seq_len 2048 --max_steps 20000 --grad_checkpoint --low_ram --num_workers 0 --shuffle_buffer_docs 256 --tokenize_pause_s 0.2 --max_parquet_shards 8 --checkpoint_dir checkpoints --disable_wandb
+
+Want to actually log to W&B instead of --disable_wandb? Run `wandb login`
+once and drop that flag.
+
+If you OOM at batch_size 2, go smaller / shorter:
+
+    python train.py --variant 100m --precision fp4 --batch_size 1 --grad_accum 64 --seq_len 1024 --max_steps 20000 --grad_checkpoint --low_ram --num_workers 0 --shuffle_buffer_docs 256 --max_parquet_shards 8 --checkpoint_dir checkpoints --disable_wandb
+
+For comparison, the fast practical run (same recipe, BF16):
+
+    python train.py --variant 100m --precision bf16 --batch_size 4 --grad_accum 16 --seq_len 2048 --grad_checkpoint --low_ram --num_workers 0 --max_parquet_shards 8 --checkpoint_dir checkpoints --disable_wandb
+
+Resume later from the latest checkpoint:
+
+    python train.py --variant 100m --precision fp4 --resume checkpoints/100m-latest.pt --batch_size 2 --grad_accum 32 --seq_len 2048 --grad_checkpoint --low_ram --num_workers 0 --max_parquet_shards 8 --disable_wandb
+
+VRAM tuning knobs (in order of impact):
+  --batch_size 1            # biggest VRAM lever; compensate with --grad_accum
+  --seq_len 1024            # halves activation memory
+  --grad_checkpoint         # recompute loop steps instead of storing them
+  --grad_accum 64           # keeps effective batch = batch_size * grad_accum
+  --loop_iters 4            # less recurrent unroll (default 8); also less
+                            # quality per token, use only as last resort
+
+RAM tuning knobs (system RAM, not VRAM):
+  --low_ram                 # caps shuffle buffer, disables pinned staging
+  --num_workers 0           # one tokenizer in the main process (smallest RSS)
+  --shuffle_buffer_docs 256 # less buffered raw text
+  --tokenize_pause_s 0.2    # throttle downloads behind tokenization
+  --max_parquet_shards 8    # disk cache cap (~100-300 MB per parquet shard)
+  set HF_HOME to a drive with free space, e.g. in PowerShell:
+      $env:HF_HOME="D:\hf_cache"
+
+------------------------------------------------------------------------------
+4. Tokenizing the dataset on ANOTHER machine (the OOM question)
+------------------------------------------------------------------------------
+
+Short answer: YES, and there are two ways.
+
+Background: the built-in training pipeline never loads the corpus into
+memory — it streams parquet shards and tokenizes in bounded buffers. So RAM
+OOM from tokenization is not expected even on a modest laptop with the
+--low_ram flags above. But if you want the laptop to do ZERO tokenization
+(disk/RAM/CPU headroom for training), this repo now supports a fully
+offline, pre-tokenized workflow:
+
+4a. ON THE BIG MACHINE (desktop / cloud box / anything with RAM + network)
+    Same repo checkout, any OS (Linux/Mac/Windows). Install the same deps
+    (section 2, or on Linux you can just use requirements.txt). Then run:
+
+    python scripts/pretokenize_corpus.py --out_dir ./fineweb_tokens --dataset_name HuggingFaceFW/fineweb-edu --tokenizer gpt2 --train_tokens 1000000000 --val_tokens 5000000 --tokens_per_shard 100000000
+
+    This streams the corpus, tokenizes once, and writes flat binary shards:
+    fineweb_tokens/meta.json, val-00000.bin, train-00000.bin, ...
+    ~1B tokens of gpt2 tokens is about 2 GB on disk (uint16). Scale the
+    token counts to whatever you want; RAM stays constant while running.
+
+4b. MOVE THE FOLDER to the laptop however you like: USB stick/external
+    drive, LAN share, scp/sftp, rsync, cloud sync — the *.bin files are
+    self-contained and checksum-independent.
+
+4c. ON THE LAPTOP, train directly from the memmap files (no internet, no
+    tokenizer, ~0 MB of host RAM used by data):
+
+    python train.py --variant 100m --precision fp4 --batch_size 2 --grad_accum 32 --seq_len 2048 --grad_checkpoint --num_workers 2 --local_tokens_dir D:\datasets\fineweb_tokens --checkpoint_dir checkpoints --disable_wandb
+
+    The validation split (val-*.bin) is used automatically for evals.
+
+Rules / notes:
+  * Use the SAME --tokenizer on both machines (gpt2 in the commands above).
+    The vocab size is recorded in meta.json and propagates into the model.
+  * The laptop needs disk space for the folder only; token pages are memory
+    mapped by the OS and paged in on demand — RAM cost is near zero even
+    for a 100 GB token corpus.
+  * Running from an external USB drive works; an internal SSD/NVMe is
+    noticeably faster.
+
+------------------------------------------------------------------------------
+5. Troubleshooting
+------------------------------------------------------------------------------
+
+* "CUDA out of memory" on the GPU: apply the VRAM knobs in section 3 in
+  order (batch_size 1 -> seq_len 1024 -> grad_checkpoint). grad_accum
+  keeps the effective batch size constant.
+* System RAM creeping up / killed by Windows: use --low_ram --num_workers 0
+  --shuffle_buffer_docs 256 --tokenize_pause_s 0.2, or use the
+  pre-tokenized workflow in section 4 (best option for 8 GB laptops).
+* Console shows "NVFP4 emulation" instead of "Blackwell fused path":
+  your torch wheel is not the cu128 Blackwell build. Reinstall torch from
+  the cu128 index URL in section 2.
+* flash-attn / triton / transformer_engine install errors on Windows:
+  do not install them — they are Linux-only and optional; SDPA is used
+  automatically and all precision paths still work.
+* First run downloads a few parquet shards from Hugging Face (one-time,
+  cached under $env:HF_HOME). On a metered connection lower
+  --max_parquet_shards, or use the offline pre-tokenized folder.
+* DEMO MODE banner: the corpus could not be reached (offline/no deps); the
+  run uses synthetic data and metrics are meaningless. Fix network/HF
+  access or pass --local_tokens_dir.
+==============================================================================

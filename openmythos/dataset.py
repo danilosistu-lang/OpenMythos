@@ -514,6 +514,215 @@ def _network_reachable(host: str = "huggingface.co", timeout: float = 2.5) -> bo
 
 
 # ===========================================================================
+# Pre-tokenised memmap corpus (offline tokenization path)
+# ===========================================================================
+# Why this exists
+# ---------------
+# Some training hosts (small laptops, e.g. 8 GB-class RTX 5050 notebooks)
+# should not spend any RAM/CPU on tokenization at all.  A big-RAM machine can
+# run ``scripts/pretokenize_corpus.py`` once to produce flat ``*.bin`` token
+# files plus a ``meta.json``; those files are copied (USB disk / network
+# share / scp) to the training host and read back via OS memory mapping.
+# RAM cost on the reader side is effectively zero regardless of corpus size,
+# because pages are paged in on demand and never copied into the heap.
+_MEMMAP_VALID_DTYPES = ("uint16", "uint32")
+
+
+class MemmapTokensDataset(torch_data.IterableDataset):
+    """Endless packed-token windows over a pre-tokenised ``*.bin`` corpus.
+
+    Expected directory layout (produced by ``scripts/pretokenize_corpus.py``)::
+
+        tokens_dir/
+            meta.json          # {"vocab_size", "dtype", "tokenizer", "files"...}
+            train-00000.bin    # raw token-id array, flat little-endian uint16/uint32
+            train-00001.bin
+            ...
+            val-00000.bin      # optional validation split
+
+    The corpus is sliced into ``segment_tokens``-sized blocks; blocks are
+    shuffled per epoch and partitioned modulo ``world_size * num_workers`` so
+    every rank/worker owns a disjoint slice of windows.
+    """
+
+    def __init__(
+        self,
+        tokens_dir: str,
+        split: str = "train",
+        seq_len: int = 2048,
+        seed: int = 1337,
+        segment_tokens: int = 1 << 21,   # ~2M tokens/segment (~4 MB at uint16)
+    ):
+        super().__init__()
+        import json
+
+        self.tokens_dir = os.path.abspath(os.path.expanduser(tokens_dir))
+        meta_path = os.path.join(self.tokens_dir, "meta.json")
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(
+                f"no meta.json in '{self.tokens_dir}' - run "
+                "scripts/pretokenize_corpus.py to build a pre-tokenised corpus"
+            )
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        dtype = str(manifest.get("dtype", "uint16"))
+        if dtype not in _MEMMAP_VALID_DTYPES:
+            raise ValueError(
+                f"unsupported token dtype '{dtype}' in {meta_path} "
+                f"(expected one of {_MEMMAP_VALID_DTYPES})"
+            )
+        self.dtype = dtype
+        self.vocab_size = int(manifest["vocab_size"])
+        self.tokenizer_name = str(manifest.get("tokenizer", "unknown"))
+        self.seq_len = int(seq_len)
+        self.seed = int(seed)
+
+        wanted_prefix = "val" if split.strip().lower().startswith("val") else "train"
+        files = sorted(
+            f for f in os.listdir(self.tokens_dir)
+            if f.endswith(".bin") and f.split("-", 1)[0] == wanted_prefix
+        )
+        if not files:
+            if wanted_prefix == "val":
+                # Validation is optional: silently reuse the training split.
+                files = sorted(
+                    f for f in os.listdir(self.tokens_dir)
+                    if f.endswith(".bin") and f.startswith("train")
+                )
+            if not files:
+                raise FileNotFoundError(
+                    f"no '{wanted_prefix}*.bin' shards in '{self.tokens_dir}'"
+                )
+        self.files = [os.path.join(self.tokens_dir, f) for f in files]
+        self.split = "val" if wanted_prefix == "val" else "train"
+        self.segment_tokens = max(int(segment_tokens), self.seq_len + 1)
+
+        self.meta = StreamMeta(
+            dataset_name=os.path.basename(self.tokens_dir),
+            split=self.split,
+            tokenizer_name=self.tokenizer_name,
+            vocab_size=self.vocab_size,
+            seq_len=self.seq_len,
+            demo_mode=False,
+        )
+
+    def _worker_id(self) -> Tuple[int, int]:
+        info = torch_data.get_worker_info()
+        if info is None:
+            return 0, 1
+        return info.id, info.num_workers
+
+    # --------------------------------------------------------------- segments
+    def _segments(self, epoch: int):
+        """Yield ``(file_index, start, length)`` blocks for one epoch.
+
+        A window never straddles a block boundary, so short tail fragments of
+        each shard are discarded (at most ``segment_tokens`` tokens per shard,
+        i.e. a negligible fraction of any real corpus).
+        """
+        import numpy as np
+
+        np_dtype = np.dtype(self.dtype)
+        itemsize = int(np_dtype.itemsize)
+        need = self.seq_len + 1
+        blocks: list = []
+        for fi, path in enumerate(self.files):
+            file_tokens = os.path.getsize(path) // itemsize
+            if file_tokens < need:
+                continue                    # shard cannot yield a single window
+            if file_tokens >= self.segment_tokens:
+                n_seg = file_tokens // self.segment_tokens
+                for si in range(n_seg):
+                    blocks.append(
+                        (fi, si * self.segment_tokens, self.segment_tokens)
+                    )
+            else:
+                # Small shard (or tiny test corpus): use the whole file as
+                # one segment; the window loop discards only the short tail.
+                blocks.append((fi, 0, file_tokens))
+        if not blocks:
+            raise RuntimeError(
+                f"pre-tokenised corpus in '{self.tokens_dir}' contains no "
+                f"window of {self.seq_len + 1} tokens for split '{self.split}'"
+            )
+        rng = random.Random(self.seed * 7919 + epoch)
+        rng.shuffle(blocks)
+        return blocks
+
+    # ----------------------------------------------------------------- stream
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        import numpy as np
+
+        rank, world = _sync_world()
+        worker_id, n_workers = self._worker_id()
+        owner = rank * n_workers + worker_id
+        owners = max(world * n_workers, 1)
+
+        epoch = 0
+        np_dtype = np.dtype(self.dtype)
+        while True:
+            blocks = self._segments(epoch)
+            blocks = blocks[owner::owners]      # disjoint slice per rank/worker
+            open_maps: dict = {}
+            try:
+                for fi, start, length in blocks:
+                    if fi not in open_maps:
+                        open_maps[fi] = np.memmap(
+                            self.files[fi], dtype=np_dtype, mode="r"
+                        )
+                    tokens = np.asarray(open_maps[fi][start : start + length])
+                    # Walk the contiguous segment in seq_len windows; each
+                    # window is self-shifted for causal LM supervision.
+                    for off in range(0, length - self.seq_len, self.seq_len):
+                        window = tokens[off : off + self.seq_len + 1]
+                        x = torch.from_numpy(window[:-1].astype(np.int64, copy=True))
+                        y = torch.from_numpy(window[1:].astype(np.int64, copy=True))
+                        yield x, y
+            finally:
+                open_maps.clear()      # drop memmap handles each epoch
+            epoch += 1
+
+
+def get_memmap_dataloader(
+    tokens_dir: str,
+    split: str = "train",
+    batch_size: int = 8,
+    seq_len: int = 2048,
+    num_workers: int = 4,
+    seed: int = 1337,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
+    segment_tokens: int = 1 << 21,
+) -> Tuple[torch_data.DataLoader, StreamMeta]:
+    """Build a DataLoader over a pre-tokenised memmap corpus.
+
+    Near-zero host RAM: token ids are paged directly from disk by the OS;
+    no tokenizer, no parquet buffers, no HF download ever runs on this
+    machine.  Create the corpus on a big-RAM box with
+    ``scripts/pretokenize_corpus.py``, copy the folder over, and point
+    ``--local_tokens_dir`` at it.
+    """
+    dataset = MemmapTokensDataset(
+        tokens_dir=tokens_dir,
+        split=split,
+        seq_len=seq_len,
+        seed=seed,
+        segment_tokens=segment_tokens,
+    )
+    loader = torch_data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=(pin_memory and torch.cuda.is_available()),
+        prefetch_factor=max(prefetch_factor, 1) if num_workers > 0 else None,
+        persistent_workers=persistent_workers and num_workers > 0,
+        drop_last=True,
+    )
+    return loader, dataset.meta
+
+
+# ===========================================================================
 # Public factory (spec-mandated signature)
 # ===========================================================================
 def get_fineweb_dataloader(
@@ -600,8 +809,10 @@ def get_fineweb_dataloader(
 
 __all__ = [
     "FineWebStreamDataset",
+    "MemmapTokensDataset",
     "StreamMeta",
     "CharTokenizer",
     "build_tokenizer",
     "get_fineweb_dataloader",
+    "get_memmap_dataloader",
 ]

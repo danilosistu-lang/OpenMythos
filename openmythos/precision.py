@@ -340,6 +340,7 @@ def prepare_model_for_precision(model: nn.Module, precision: str,
         return model
 
     if key == "fp4":
+        global _FP4_DEGRADE_WARNED
         count = _wrap_linears(model, _low_precision_convertible, NVFP4QuantLinear,
                               {"group_size": 16})
         if is_blackwell(device_index):

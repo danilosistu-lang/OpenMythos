@@ -263,6 +263,32 @@ cache requirement:
 Swap corpora freely: `--dataset_name HuggingFaceFW/fineweb` (or any text column
 corpus) works unchanged.
 
+### Pre-tokenising on a separate machine (RAM-constrained training hosts)
+
+On-the-fly streaming already keeps host RAM constant, but a small training
+laptop (e.g. 8 GB-class RTX 50-series notebooks) can be relieved of *all*
+tokenization work. Tokenise once on a big-RAM machine and train from flat
+binary shards:
+
+```bash
+# big machine: streams the corpus, writes fineweb_tokens/{meta.json,*.bin}
+python scripts/pretokenize_corpus.py \
+    --out_dir ./fineweb_tokens --tokenizer gpt2 \
+    --train_tokens 1000000000 --val_tokens 5000000 \
+    --tokens_per_shard 100000000
+
+# copy the folder to the training host (USB drive / scp / share), then:
+python train.py --variant 100m --precision fp4 \
+    --local_tokens_dir ./fineweb_tokens --grad_checkpoint --low_ram
+```
+
+Tokens are stored as flat `uint16`/`uint32` ids and read back via OS memory
+mapping: reader-side RAM is effectively zero regardless of corpus size, no
+tokenizer or network access is needed on the training host, and the
+validation split is picked up automatically. See
+[`WINDOWS_RTX5050_SETUP.txt`](WINDOWS_RTX5050_SETUP.txt) for a complete
+Windows + RTX 5050 laptop walkthrough.
+
 ## Distributed training
 
 - `openmythos.utils.setup_distributed()` initialises NCCL under `torchrun` and

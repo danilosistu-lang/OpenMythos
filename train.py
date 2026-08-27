@@ -30,7 +30,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from openmythos.attention import flash_attention_backend                    # noqa: E402
 from openmythos.config import KNOWN_VARIANTS, MythosConfig                  # noqa: E402
-from openmythos.dataset import get_fineweb_dataloader                       # noqa: E402
+from openmythos.dataset import (                                          # noqa: E402
+    get_fineweb_dataloader,
+    get_memmap_dataloader,
+)
 from openmythos.model import OpenMythosForCausalLM                          # noqa: E402
 from openmythos.precision import (                                          # noqa: E402
     describe_device_precision_hardware,
@@ -103,6 +106,11 @@ def parse_args() -> argparse.Namespace:
                    help="native: huggingface_hub shard download + local "
                         "pyarrow reads (timeout-proof); stream: legacy live "
                         "load_dataset(streaming=True) HTTP reader")
+    p.add_argument("--local_tokens_dir", default=None,
+                   help="folder of pre-tokenised *.bin shards + meta.json "
+                        "(built with scripts/pretokenize_corpus.py). When "
+                        "set, all HF download/tokenization is bypassed and "
+                        "tokens are read via memory map (~zero host RAM)")
     p.add_argument("--max_parquet_shards", type=int, default=64,
                    help="disk cap for native mode: how many remote parquet "
                         "shards (~100-300 MB each) to cache")
@@ -241,37 +249,62 @@ def main() -> int:
              flash_attention_backend())
 
     # ---- data (built FIRST so vocab matches the tokenizer) ------------------
-    train_loader, meta = get_fineweb_dataloader(
-        dataset_name=args.dataset_name,
-        split="train",
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        num_workers=args.num_workers,
-        tokenizer_name=args.tokenizer_name,
-        seed=args.seed + dist.rank,
-        shuffle_buffer_docs=args.shuffle_buffer_docs,
-        low_ram_profile=args.low_ram,
-        tokenize_chunk_docs=args.tokenize_chunk_docs,
-        tokenize_pause_s=args.tokenize_pause_s,
-        data_mode=args.data_mode,
-        max_parquet_shards=args.max_parquet_shards,
-    )
-    eval_loader, eval_meta = get_fineweb_dataloader(
-        dataset_name=args.dataset_name,
-        split="train",
-        batch_size=max(1, args.batch_size),
-        seq_len=args.seq_len,
-        num_workers=0,          # main-process streaming: no extra worker RSS
-                                # and no process pile-up across repeated evals
-        tokenizer_name=args.tokenizer_name,
-        seed=args.seed + 777 + dist.rank,
-        shuffle_buffer_docs=args.shuffle_buffer_docs,
-        low_ram_profile=True,   # eval never needs deep shuffling
-        tokenize_chunk_docs=args.tokenize_chunk_docs,
-        tokenize_pause_s=args.tokenize_pause_s,
-        data_mode=args.data_mode,
-        max_parquet_shards=args.max_parquet_shards,
-    )
+    if args.local_tokens_dir:
+        # Pre-tokenised memmap corpus: no HF access, no tokenizer, ~zero RAM.
+        # Build it on a big-RAM machine with scripts/pretokenize_corpus.py and
+        # copy the folder to this host.
+        log.info("Using local pre-tokenised memmap corpus: %s",
+                 args.local_tokens_dir)
+        train_loader, meta = get_memmap_dataloader(
+            tokens_dir=args.local_tokens_dir,
+            split="train",
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            num_workers=args.num_workers,
+            seed=args.seed + dist.rank,
+            pin_memory=not args.low_ram,
+        )
+        eval_loader, eval_meta = get_memmap_dataloader(
+            tokens_dir=args.local_tokens_dir,
+            split="val",
+            batch_size=max(1, args.batch_size),
+            seq_len=args.seq_len,
+            num_workers=0,          # main-process reads: no extra worker RSS
+            seed=args.seed + 777 + dist.rank,
+            pin_memory=not args.low_ram,
+        )
+    else:
+        train_loader, meta = get_fineweb_dataloader(
+            dataset_name=args.dataset_name,
+            split="train",
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            num_workers=args.num_workers,
+            tokenizer_name=args.tokenizer_name,
+            seed=args.seed + dist.rank,
+            shuffle_buffer_docs=args.shuffle_buffer_docs,
+            low_ram_profile=args.low_ram,
+            tokenize_chunk_docs=args.tokenize_chunk_docs,
+            tokenize_pause_s=args.tokenize_pause_s,
+            data_mode=args.data_mode,
+            max_parquet_shards=args.max_parquet_shards,
+        )
+        eval_loader, eval_meta = get_fineweb_dataloader(
+            dataset_name=args.dataset_name,
+            split="train",
+            batch_size=max(1, args.batch_size),
+            seq_len=args.seq_len,
+            num_workers=0,          # main-process streaming: no extra worker RSS
+                                    # and no process pile-up across repeated evals
+            tokenizer_name=args.tokenizer_name,
+            seed=args.seed + 777 + dist.rank,
+            shuffle_buffer_docs=args.shuffle_buffer_docs,
+            low_ram_profile=True,   # eval never needs deep shuffling
+            tokenize_chunk_docs=args.tokenize_chunk_docs,
+            tokenize_pause_s=args.tokenize_pause_s,
+            data_mode=args.data_mode,
+            max_parquet_shards=args.max_parquet_shards,
+        )
     if meta.demo_mode or eval_meta.demo_mode:
         log.warning("=" * 78)
         log.warning("DEMO MODE: synthetic offline corpus active "
@@ -429,6 +462,10 @@ def main() -> int:
             args.eval_interval > 0
             and (step + 1) % args.eval_interval == 0
         )
+        should_ckpt = (
+            args.checkpoint_interval > 0
+            and (step + 1) % args.checkpoint_interval == 0
+        )
         if should_eval and is_main:
             val_ce, val_ppl = run_evaluation(
                 raw, eval_loader, precision_ctx_factory,
@@ -445,7 +482,7 @@ def main() -> int:
                 {"config": cfg.to_dict(), "args": vars(args)},
             )
 
-        if (step + 1) % args.checkpoint_interval == 0 and is_main:
+        if should_ckpt and is_main:
             save_checkpoint(
                 ckpt_dir / f"{args.variant}-latest.pt", wrapped, optimizer,
                 scheduler, dist, step + 1, best_val,
