@@ -34,6 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="model size the settings should target")
     p.add_argument("--seq_len", type=int, default=None,
                    help="training sequence length (default: variant preset)")
+    p.add_argument("--target", type=float, default=0.30,
+                   help="MFU target the tuner aims for (0.30 = 30%%); the "
+                        "report shows the honest gap when a card cannot "
+                        "reach it")
     p.add_argument("--world_size", type=int,
                    default=int(__import__("os").environ.get("WORLD_SIZE", "1")
                                or 1),
@@ -135,7 +139,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     profile = detect_and_build_profile(
         variant=args.variant, seq_len=args.seq_len,
         world_size=args.world_size, probe_pkgs=not args.simulate,
-        simulate=args.simulate,
+        simulate=args.simulate, mfu_target=args.target,
     )
 
     if args.json:
