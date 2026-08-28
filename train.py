@@ -78,12 +78,13 @@ def parse_args() -> argparse.Namespace:
                    help="bf16 (default / Ampere+) | fp16 (pre-Ampere tensor "
                         "cores, GradScaler auto-enabled) | fp8 | fp4 | fp32")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction,
-                   default=False,
-                   help="torch.compile the model (tuner suggests when the "
-                        "card benefits)")
-    p.add_argument("--compile_mode", default="default",
+                   default=None,
+                   help="torch.compile the model (default: auto_tuned per "
+                        "GPU card; explicit --compile/--no-compile wins)")
+    p.add_argument("--compile_mode", default=None,
                    choices=["default", "max-autotune", "reduce-overhead"],
-                   help="torch.compile mode")
+                   help="torch.compile mode (default: the detected card's "
+                        "per-GPU tuned mode)")
     p.add_argument("--loop_iters", type=int, default=8,
                    help="recurrent depth T executed per forward pass")
     p.add_argument("--use_flash_attn", action=argparse.BooleanOptionalAction,
@@ -116,13 +117,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--low_ram", action="store_true",
                    help="constant-RAM profile: caps shuffle buffer at 512 "
                         "docs and disables pinned-memory staging")
-    p.add_argument("--tokenize_chunk_docs", type=int, default=30,
+    p.add_argument("--tokenize_chunk_docs", type=int, default=None,
                    help="download-pacing gate: after every N raw documents "
                         "the stream tokenises/packs the batch fully before "
-                        "resuming the parquet download")
-    p.add_argument("--tokenize_pause_s", type=float, default=0.05,
-                   help="timer nap (seconds) after each paced chunk; raise "
-                        "e.g. to 1.0 on very slow/small-RAM hosts")
+                        "resuming the parquet download (default: the "
+                        "detected card's tuned data-feed value, else 30)")
+    p.add_argument("--tokenize_pause_s", type=float, default=None,
+                   help="timer nap (seconds) after each paced chunk "
+                        "(default: the detected card's tuned data-feed "
+                        "value, else 0.05)")
     p.add_argument("--data_mode", choices=["native", "stream"], default="native",
                    help="native: huggingface_hub shard download + local "
                         "pyarrow reads (timeout-proof); stream: legacy live "
@@ -303,6 +306,16 @@ def main() -> int:
         _resolve(args.use_flash_attn, tuned.get("use_flash_attn"), True))
     args.grad_checkpoint = bool(
         _resolve(args.grad_checkpoint, tuned.get("grad_checkpoint"), False))
+    args.compile = bool(
+        _resolve(args.compile, tuned.get("compile"), False))
+    args.compile_mode = str(
+        _resolve(args.compile_mode, tuned.get("compile_mode"), "default"))
+    args.tokenize_chunk_docs = int(
+        _resolve(args.tokenize_chunk_docs,
+                 tuned.get("tokenize_chunk_docs"), 30))
+    args.tokenize_pause_s = float(
+        _resolve(args.tokenize_pause_s,
+                 tuned.get("tokenize_pause_s"), 0.05))
 
     # ---- environment bootstrap ---------------------------------------------
     torch.set_float32_matmul_precision("high")     # TF32 paths on Ampere+
@@ -319,6 +332,18 @@ def main() -> int:
         apply_torch_flags(auto_profile)   # SDPA kernel priorities per GPU
         if is_main:
             log.info("\n%s", pretty_report(auto_profile))
+            _mp = auto_profile.get("mfu", {})
+            if _mp.get("projected") is not None:
+                log.info(
+                    "MFU plan: projected %.1f%% vs %.0f%% target -> %s "
+                    "(batch %d x seq %d, %d tokens/micro)",
+                    _mp["projected"] * 100, _mp.get("target", 0.30) * 100,
+                    "TARGET MET" if _mp.get("meets_target")
+                    else "gap - see verdict in banner",
+                    auto_profile["settings"]["batch_size"],
+                    auto_profile["settings"]["seq_len"],
+                    auto_profile["settings"]["tokens_per_micro"],
+                )
 
     log.info("Hardware: %s", describe_device_precision_hardware())
     log.info("Attention kernels: %s backend selected",
