@@ -275,27 +275,46 @@ parameters so routing efficiency is visible in logs from step zero.
 Tesla P100/P40/P4, V100, T4, the GTX 16xx / RTX 20xx / 30xx / 40xx / 50xx
 consumer stacks, A-series datacenter (A100/A800/A30/A10/A40/A2), L4/L20/L40/
 L40S, RTX A/Ada workstations, H100/H200/H800/GH200/H20, and both Blackwell
-generations (B100/B200/GB300-class and RTX 50xx / RTX PRO 6000) — and turns
-the detected card into an MFU-oriented settings bundle: precision ladder,
-FlashAttention on/off, SDPA kernel priorities, batch/accumulation split sized
-from a weights+optimizer+activations memory model, dataloader workers,
-`torch.compile` advice, allocator/NCCL env tweaks and CUDA/driver gates
-(e.g. Blackwell's CUDA 12.8+ requirement). Unknown cards fall back to a
-profile synthesised from their compute capability, so nothing crashes.
+generations (B100/B200/GB300-class and RTX 50xx / RTX PRO 6000). **Every
+card has its own hand-researched tuning entry** (the `TUNE_DB`): a precision
+ladder, the torch.compile mode that pays off on that die, SDPA kernel
+priorities, per-architecture cuBLAS/NCCL/allocator env knobs, a data-feed
+pacing plan that keeps the GPU fed, checkpointing bias, and a `kernel_eff`
+figure — the fraction of the datasheet dense peak a well-tuned large GEMM
+actually sustains on that silicon, with an architecture rationale for each.
+Unknown cards fall back to a profile synthesised from their compute
+capability, so nothing crashes.
+
+The tuner's job is an **explicit MFU target (30% by default)**. A roofline
+engine per card computes:
+
+- the **ridge point** `peak TFLOPS / GB/s` (FLOP per byte moved) of the die,
+- the **arithmetic intensity** of a training micro-step as a function of
+  micro-batch, including weight traffic, AdamW/DDP amortisation, activation
+  traffic and checkpoint recompute,
+- a **wave factor** (does a d_model-wide GEMM even fill the SMs at this
+  batch?),
+- and it then **sweeps micro-batch and the checkpointing on/off option** to
+  maximise projected MFU, preferring the smallest batch that already meets
+  the target. The banner prints the projection, the gap, and an honest
+  verdict: bandwidth-bound cards and pre-tensor-core silicon are told they
+  cannot reach 30% and why — the target is never faked.
 
 Two one-line integrations keep training honest on any silicon:
 
 - **`--auto_tune`** detects the GPU, applies env tweaks *before* CUDA init,
-  prints the full profile, and fills every un-set tuning flag (precision,
-  batch, accumulation, workers, flash attention, checkpointing). Explicit
-  flags always win; on hosts with no GPU it is a loud no-op.
+  prints the full profile **with the MFU plan**, and fills every un-set
+  tuning flag (precision, batch, accumulation, workers, flash attention,
+  checkpointing, compile mode, data-feed pacing). Explicit flags always
+  win; on hosts with no GPU it is a loud no-op.
 - The **MFU gauge** now divides by the *detected card's* dense peak for the
   running precision instead of a hardcoded H100 constant — the `mfu/estimate`
   logged metric is truthful from a T4 to a B300.
 
 ```bash
 # inspect this host
-python scripts/tune_gpu.py                     # pretty report + launch cmd
+python scripts/tune_gpu.py                     # pretty report + MFU plan + launch cmd
+python scripts/tune_gpu.py --target 0.35       # aim at a different MFU target
 python scripts/tune_gpu.py --json              # machine-readable
 python scripts/tune_gpu.py --env               # eval $(... --env) in shells
 python scripts/tune_gpu.py --list              # dump the whole GPU DB
@@ -309,23 +328,29 @@ python scripts/tune_gpu.py --simulate "cc=9.0,vram=80,sms=132"
 python scripts/tune_gpu.py --bench
 
 # validate the DB + every profile anywhere (CPU-only safe)
-python scripts/tune_gpu.py --self-test         # 69/69 checks
+python scripts/tune_gpu.py --self-test         # 136/136 checks
 
 # and just train with it
 python train.py --auto_tune --variant 500m
 HF_DATASETS_OFFLINE=0 torchrun --nproc_per_node=8 train.py --auto_tune --variant 10b
 ```
 
-Representative tuned outcomes (variant 500m, seq 4096):
+Representative tuned outcomes (the MFU plan is per card; `proj` = projected
+MFU vs the 30% target):
 
-| Card | Precision | Batch × accum | FlashAttention | Notes |
+| Card | Variant | Plan | proj | Notes |
 |---|---|---|---|---|
-| Tesla T4 (16 GB) | `fp16` + GradScaler | 4 × 8 | off (SDPA mem-eff.) | 65 TF fp16 TCs; 70 W |
-| RTX 3090 (24 GB) | `bf16` | 4 × 8 | FA2 | reproduces classic defaults |
-| RTX 4090 (24 GB) | `bf16` | 4 × 8 | FA2 | fp8 opt-in via TE/torchao |
-| H100 SXM (80 GB) | `bf16` (fp8 if TE) | 21 × 2 | FA2/FA3 | `mfu` vs 990 TF |
-| B300 (288 GB) | `bf16` (fp8/fp4 path) | 64 × 1 for 7b | SDPA/cuDNN | CUDA 12.8+, driver ≥ 570 |
-| RTX 5050 (8 GB) | `bf16` | 1 × 32 | off (SDPA/cuDNN) | sm_120; CUDA 12.8+ |
+| Tesla T4 ×2 (16 GB) | 100m s2048 | `fp16` 10×6, no-ckpt, compile `reduce-overhead` | 29.7% GAP | 320 GB/s + 70 W: kernel-eff ceiling; CUDA graphs are the lever |
+| RTX 3090 (24 GB) | 500m s4096 | `bf16` 8×4, FA2, compile `reduce-overhead` | 32.2% MET | classic defaults, now justified per die |
+| RTX 4090 (24 GB) | 500m s4096 | `bf16` 10×3, FA2, compile `max-autotune` | 26.7% GAP | 24 GB cannot fit a wave-filling batch; use ×2 GPUs |
+| A100 80GB | 100m s2048 | `bf16` 17×4, FA2, no-ckpt, `max-autotune` | 30.9% MET | checkpointing off: recompute was burning FLOPs |
+| H100 SXM (80 GB) | 100m s2048 | `bf16`/`fp8` 19×3, FA2, no-ckpt | 30.1% MET | fp8 needs TE/torchao installed |
+| B300 (288 GB) | 100m s2048 | `bf16`/`fp8` 26×2, cuDNN SDPA, `max-autotune` | 30.3% MET | CUDA 12.8+, driver ≥ 570 |
+| RTX 5050 (8 GB) | 500m s4096 | `bf16` 1×32, cuDNN SDPA | 9.8% GAP | honest ceiling: 224 GB/s entry die |
+
+The trainer logs `mfu/estimate` every step — compare it against the banner's
+projection; a large shortfall means the data feed is starving the GPU (raise
+`--tokenize_chunk_docs`), not the silicon.
 
 Security/robustness notes: multi-GPU GeForce rigs automatically get
 `NCCL_P2P_DISABLE=1` (consumer cards lack reliable P2P), and every profile
