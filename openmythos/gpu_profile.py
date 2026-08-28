@@ -128,8 +128,10 @@ GPU_DB: List[Dict[str, Any]] = [
        (7, 0), "volta", 80, 32, 900, 300, fp32=15.7, fp16=125,
        note="use fp16+GradScaler: real 125 TF tensor cores"),
     # ------------------------------------------------------- Turing (7.5)
-    _g("Tesla T4", ["T4"], (7, 5), "turing", 40, 16, 320, 70,
-       fp32=8.1, fp16=65, note="70 W cap; fp16 tensor cores are the only win"),
+    _g("Tesla T4", ["T4"], (7, 5), "turing", 40, 14.5, 320, 70,
+       fp32=8.1, fp16=65,
+       note="70 W cap; fp16 tensor cores are the only win. vram=USABLE "
+            "14.5 GiB (16 GB nominal; clouds report 14.56 total capacity)"),
     _g("RTX 2080 Ti", ["2080 Ti"], (7, 5), "turing", 68, 11, 616, 250,
        fp32=13.4, fp16=107.6),
     _g("RTX 2080", ["RTX 2080"], (7, 5), "turing", 46, 8, 448, 215,
@@ -1122,7 +1124,18 @@ def build_profile(det: Detection, variant: str = "500m",
     # Two capacity variants: with and without per-loop-step checkpointing.
     # The MFU seeker prefers the no-ckpt option whenever it both fits and
     # projects higher utilisation (recompute burns ~33% of the FLOPs).
-    static_gb = _NOMINAL_PARAMS_B[vkey] * 16.0 + 0.9
+    #
+    # Static overhead (calibrated against a real 2x T4 OOM at 98% capacity,
+    # 2026-08): fp16 weights+grads+fp32 AdamW moments scale with params
+    # (16 bytes/param); the constant covers CUDA context, cuDNN workspaces,
+    # GradScaler scratch and DDP buckets.  Multi-GPU adds NCCL staging
+    # buffers (SHM transport when P2P is unavailable - cloud VMs);
+    # CUDA-graph pools (compile_mode=reduce-overhead) reserve private
+    # segments the allocator can never reuse for anything else.
+    graphs_likely = tune.get("compile_mode") == "reduce-overhead"
+    static_gb = (_NOMINAL_PARAMS_B[vkey] * 16.0 + 1.1
+                 + (0.5 if int(world_size) > 1 else 0.0)
+                 + (0.4 if graphs_likely else 0.0))
     per_seq_gb = _PER_SEQ_GB[vkey] * (seq_len / 4096.0) ** 1.6
     usable = vram * 0.88 - static_gb
     ckpt_bias = tune.get("ckpt", "auto")
@@ -1136,7 +1149,13 @@ def build_profile(det: Detection, variant: str = "500m",
         cap_ckpt, cap_nockpt = 1, 0
     else:
         cap_ckpt = max(1, min(64, int(usable / max(per_seq_gb / 2.5, 0.4))))
-        cap_nockpt = max(1, min(64, int(usable / max(per_seq_gb, 0.4))))
+        # Headroom guard: a no-ckpt plan that "fits exactly" has zero margin
+        # for allocator fragmentation, cuDNN algo workspace variance and
+        # graph-pool growth - measured OOM happened at 98% of capacity.
+        # Only 85% of the theoretical no-ckpt activation budget is offered
+        # to the seeker; the ckpt option keeps the full budget because its
+        # activation footprint is ~2.5x smaller by construction.
+        cap_nockpt = max(1, min(64, int(usable * 0.85 / max(per_seq_gb, 0.4))))
     target = _TARGET_SEQS[vkey]
 
     # ------------------------------------------------------- data feed
@@ -1616,8 +1635,15 @@ def self_test(verbose: bool = True) -> Tuple[int, int]:
     prof = detect_and_build_profile(simulate="T4", variant="100m",
                                     seq_len=2048, world_size=2,
                                     probe_pkgs=False)
-    check("T4 x2 100m: seeker prefers no-checkpoint when it fits",
+    # OOM-calibrated (real 2x T4, 2026-08): the unguarded seeker picked
+    # no-ckpt batch 28 = 98% of VRAM = OOM on a fresh allocation pattern.
+    # With the 85% headroom guard + real usable VRAM + NCCL/graph overhead,
+    # the no-ckpt cap is 19; the seeker must stay inside it and still
+    # project >= 20% MFU.  19 = int(usable*0.85/per_seq) under current
+    # constants - if this pin breaks, re-derive from the memory model.
+    check("T4 x2 100m: no-ckpt batch inside 85% headroom guard (OOM-cal)",
           prof["settings"]["grad_checkpoint"] is False
+          and prof["settings"]["batch_size"] <= 19
           and prof["mfu"]["projected"] >= 0.20)
     prof = detect_and_build_profile(simulate="A100 80GB", variant="500m",
                                     probe_pkgs=False)
