@@ -30,10 +30,11 @@ tokens→ │  PRELUDE   │ → │  RECURRENT CORE (loop × T)    │ → │ 
 6. [Model variants](#model-variants)
 7. [Precision scaling guide (BF16 / FP16 / FP8 / NVFP4)](#precision-scaling-guide)
 8. [GPU auto-tune — MFU profiles for every card](#gpu-auto-tune--mfu-profiles-for-every-card)
-9. [Dataset streaming](#dataset-streaming)
-10. [Distributed training](#distributed-training)
-11. [Checkpointing & resuming](#checkpointing--resuming)
-12. [Verification suite](#verification-suite)
+9. [Training stability — loss spikes, fp16 skips, router health](#training-stability--loss-spikes-fp16-skips-router-health)
+10. [Dataset streaming](#dataset-streaming)
+11. [Distributed training](#distributed-training)
+12. [Checkpointing & resuming](#checkpointing--resuming)
+13. [Verification suite](#verification-suite)
 
 ---
 
@@ -199,7 +200,8 @@ Key CLI flags (see `--help` for the full set): `--variant`, `--dataset_name`,
 --no-use_flash_attn`, `--checkpoint_dir`, `--wandb_project`,
 plus production extras (`--resume`, `--eval_interval`, `--grad_checkpoint`,
 `--dist_strategy`, `--attn_type`, `--tokenizer_name`,
-`--shuffle_buffer_docs`, `--low_ram`, …).
+`--shuffle_buffer_docs`, `--low_ram`, `--aux_loss_coeff`,
+`--z_loss_coeff`, …).
 
 On RAM-constrained hosts (< 32 GB) add `--low_ram --num_workers 2 --batch_size 2`:
 the data path stays strictly constant-RAM end to end — HF streaming pulls one
@@ -329,6 +331,46 @@ Security/robustness notes: multi-GPU GeForce rigs automatically get
 `NCCL_P2P_DISABLE=1` (consumer cards lack reliable P2P), and every profile
 exports `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to tame
 fragmentation on small cards.
+
+## Training stability — loss spikes, fp16 skips, router health
+
+Short spikes on a MoE + recurrent loss curve (e.g. 5.2 → 6.9 for a step,
+then recovery) have two very different origins, and the trainer now
+instruments both.
+
+**Router health (the big one).** Prior builds had a silent defect: with
+`--grad_checkpoint` active, the MoE load-balancing loss was read from a
+module attribute *after* the checkpointed (no-grad) forward pass, so it
+was detached from the autograd graph — balancing never sent a gradient,
+the router drifted, and the run showed exactly the
+spike-then-recover signature. `RecurrentBlock.forward` now *returns* its
+`(aux, z)` routing losses so they ride through the checkpoint recompute,
+and a **router z-loss** (ST-MoE) is applied on top:
+
+- `--z_loss_coeff` (default `1e-3`) penalises the squared log-partition
+  of the router logits, damping the top-k assignment flip-flops that
+  cause transient spikes; set `0` to disable.
+- The balance loss is collected per loop *execution* (the weight-shared
+  stack re-routes every iteration), not once per block.
+- Logged keys `loss/aux`, `loss/z`, `moe/router_entropy`: healthy runs
+  keep aux near 1.0 and entropy near `ln(num_experts)`.
+
+**fp16 GradScaler churn.** Overflow steps (fp16 on T4/V100-class cards)
+are now detected by scale comparison, counted, and no longer consume an
+LR-schedule step:
+
+- `--scaler_init_scale` (default 65536) and `--scaler_growth_interval`
+  (default 2000; raise to 4000+ if skips repeat every few hundred steps);
+- logged keys `train/grad_norm`, `train/loss_scale`,
+  `train/skipped_steps`;
+- an EMA-based warning prints grad-norm, router entropy, aux/z and the
+  loss scale the moment a spike is detected, separating one-off hard
+  batches (recover by themselves) from systematic scale churn (grad_norm
+  pinned at the clip value with a rising skip count).
+
+Regression coverage: `python scripts/test_routing_stability.py`
+(12 deterministic CPU checks) proves the routing-loss gradients survive
+gradient checkpointing on both attention backbones.
 
 ## Dataset acquisition & streaming
 
