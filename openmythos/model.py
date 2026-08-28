@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from functools import partial
-from typing import Iterator, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -153,7 +153,16 @@ class RecurrentBlock(nn.Module):
         t: int,
         cos: torch.Tensor,
         sin: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one weight-shared loop step; returns ``(h_next, aux, z)``.
+
+        The two routing losses are *returned* rather than read from module
+        attributes after the fact: under gradient checkpointing the first
+        (no-grad) pass would otherwise overwrite the attributes with
+        graph-less tensors, silently detaching the load-balancing and
+        z-loss objectives from the optimiser -- a classic recipe for
+        router drift and transient loss spikes.
+        """
         g_attn, g_ffn = self.conditioner(e)
 
         # --- attention sub-layer with depth adapter -------------------------
@@ -166,7 +175,7 @@ class RecurrentBlock(nn.Module):
 
         # --- spectrally-stable LTI state injection --------------------------
         h = self.lti(h, e)
-        return h
+        return h, self.moe.last_aux_loss, self.moe.last_z_loss
 
 
 class PreludeStack(nn.Module):
@@ -239,6 +248,7 @@ class OpenMythosForCausalLM(nn.Module):
         #: Diagnostics filled by the last forward pass (kept as plain floats).
         self.last_ce_loss: float = float("nan")
         self.last_aux_loss: float = float("nan")
+        self.last_z_loss: float = float("nan")
         self.last_loop_iters: int = self.max_loop_iters
 
         self.apply(self._init_weights)
@@ -307,22 +317,32 @@ class OpenMythosForCausalLM(nn.Module):
         h, e = self.prelude(x, cos, sin)
 
         # ---- stage 2: recurrent core ----------------------------------------
+        # aux/z routing losses are collected per *execution* (the stack is
+        # weight-shared, so every loop iteration re-routes) and returned
+        # through the block -- this keeps them attached to the autograd
+        # graph even when every execution runs under grad checkpointing.
         steps = loop_iters if loop_iters is not None else self.max_loop_iters
+        aux_terms: List[torch.Tensor] = []
+        z_terms: List[torch.Tensor] = []
         for t in range(steps):
             for block in self.recurrent_stack:
                 if self.gradient_checkpointing and self.training:
                     step_fn = partial(block, t=t, cos=cos, sin=sin)
-                    h = torch.utils.checkpoint.checkpoint(
+                    out = torch.utils.checkpoint.checkpoint(
                         step_fn, h, e, use_reentrant=False
                     )
                 else:
-                    h = block(h, e, t=t, cos=cos, sin=sin)
+                    out = block(h, e, t=t, cos=cos, sin=sin)
+                h = out[0]
+                if len(out) > 1 and out[1] is not None:
+                    aux_terms.append(out[1])
+                    z_terms.append(out[2])
 
         # ---- stage 3: coda + projection --------------------------------------
         out = self.final_norm(self.coda(h, cos, sin))
         logits = F.linear(out, self.projection_weight())
 
-        loss_dict = {"ce": 0.0, "aux": 0.0}
+        loss_dict = {"ce": 0.0, "aux": 0.0, "z": 0.0}
         loss = None
         if targets is not None:
             ce = F.cross_entropy(
@@ -330,18 +350,24 @@ class OpenMythosForCausalLM(nn.Module):
                 targets.reshape(-1).long(),
                 ignore_index=-100,
             )
-            aux_terms = [
-                float(moe.last_aux_loss.detach())  # logging only
-                for moe in self.iter_moe_layers()
-                if moe.last_aux_loss is not None
-            ]
             self.last_ce_loss = float(ce.detach())
-            self.last_aux_loss = sum(aux_terms) / max(len(aux_terms), 1)
+            self.last_aux_loss = (
+                sum(float(a.detach()) for a in aux_terms) / max(len(aux_terms), 1))
+            self.last_z_loss = (
+                sum(float(z_.detach()) for z_ in z_terms) / max(len(z_terms), 1))
             self.last_loop_iters = int(steps)
 
-            total = ce + self.config.aux_loss_coeff * self.aux_loss_tensor()
+            # Total objective: CE + balance loss + router z-loss.  Both
+            # auxiliary terms are stacked from live, graph-attached tensors
+            # (they survived checkpointing by construction above).
+            total = ce
+            if aux_terms:
+                total = total + self.config.aux_loss_coeff * torch.stack(aux_terms).mean()
+            if z_terms:
+                total = total + self.config.z_loss_coeff * torch.stack(z_terms).mean()
             loss_dict["ce"] = self.last_ce_loss
             loss_dict["aux"] = self.last_aux_loss
+            loss_dict["z"] = self.last_z_loss
             loss = total
 
         return logits, loss, loss_dict
@@ -356,7 +382,12 @@ class OpenMythosForCausalLM(nn.Module):
             yield blk.moe
 
     def aux_loss_tensor(self) -> torch.Tensor:
-        """Differentiable mean load-balancing loss across all MoE layers."""
+        """Legacy helper: mean balance loss from the last forward's attrs.
+
+        The training forward no longer relies on this (it consumes the
+        per-execution terms returned by :class:`RecurrentBlock`, which
+        survive gradient checkpointing); kept for external callers.
+        """
         terms = [
             moe.last_aux_loss
             for moe in self.iter_moe_layers()
