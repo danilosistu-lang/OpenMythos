@@ -103,6 +103,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_lr_ratio", type=float, default=0.1)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--aux_loss_coeff", type=float, default=0.01)
+    p.add_argument("--z_loss_coeff", type=float, default=1e-3,
+                   help="router logit-magnitude (ST-MoE z) loss weight; "
+                        "damps top-k routing flips, a classic source of "
+                        "transient loss spikes in MoE training")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--num_workers", type=int, default=None,
                    help="dataloader workers (default: 4, or auto_tuned)")
@@ -134,6 +138,11 @@ def parse_args() -> argparse.Namespace:
                    help="recompute loop steps to save VRAM (default: off, "
                         "or auto_tuned on for small cards)")
     p.add_argument("--log_interval", type=int, default=10)
+    p.add_argument("--scaler_init_scale", type=float, default=65536.0,
+                   help="fp16 GradScaler initial loss scale")
+    p.add_argument("--scaler_growth_interval", type=int, default=2000,
+                   help="fp16 GradScaler: steps between 2x scale growth; "
+                        "raise (e.g. 4000) to reduce overflow-skip churn")
     p.add_argument("--eval_interval", type=int, default=500)
     p.add_argument("--eval_iters", type=int, default=16)
     p.add_argument("--checkpoint_interval", type=int, default=1000)
@@ -365,6 +374,7 @@ def main() -> int:
         use_flash_attn=args.use_flash_attn,
         dropout=args.dropout,
         aux_loss_coeff=args.aux_loss_coeff,
+        z_loss_coeff=args.z_loss_coeff,
         **overrides,
     )
 
@@ -416,9 +426,16 @@ def main() -> int:
     # fp16 runs (pre-Ampere tensor cores) need loss scaling to keep small
     # gradients alive; bf16/fp8/fp4 paths scale-free and leave it disabled.
     use_scaler = args.precision == "fp16" and str(device).startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=use_scaler,
+        init_scale=args.scaler_init_scale,
+        growth_interval=args.scaler_growth_interval,
+    )
     if use_scaler:
-        log.info("GradScaler enabled for fp16 training (dynamic loss scale).")
+        log.info("GradScaler enabled for fp16 training (dynamic loss scale, "
+                 "init %.0f, growth every %d steps).",
+                 args.scaler_init_scale, args.scaler_growth_interval)
 
     # Truthful MFU denominator: dense peak of THIS card for THIS precision,
     # replacing the old hardcoded H100 constant.
@@ -470,10 +487,14 @@ def main() -> int:
     data_iter = iter(train_loader)
     t0 = time.time()
     tokens_seen = 0
+    skipped_steps = 0          # fp16 overflow skips (update not applied)
+    ema_ce: float = float("nan")   # spike detector baseline
 
     for step in range(start_step, args.max_steps):
         lr_now = scheduler(step)
         micro_losses = []
+        last_info: dict = {}
+        grad_norm: float = 0.0
         stepped_this_round = False
 
         for micro in range(args.grad_accum):
@@ -498,19 +519,36 @@ def main() -> int:
                 scaled = scaler.scale(scaled)
             scaled.backward()
             micro_losses.append(info["ce"])
+            last_info = info
             tokens_seen += batch_x.numel()
             del logits, loss_total, batch_x, batch_y
 
             if micro == args.grad_accum - 1:
+                pre_scale = scaler.get_scale() if use_scaler else 0.0
                 if use_scaler:
                     scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(raw.parameters(), args.grad_clip)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                    raw.parameters(), args.grad_clip))
+                stepped_ok = True
                 if use_scaler:
                     scaler.step(optimizer)
                     scaler.update()
+                    if scaler.get_scale() < pre_scale:
+                        # Overflow: the update was NOT applied.  Do not burn
+                        # an LR-schedule step on a no-op.
+                        stepped_ok = False
+                        skipped_steps += 1
+                        if skipped_steps <= 5 or skipped_steps % 50 == 0:
+                            log.warning(
+                                "fp16 overflow @step %d: optimizer step "
+                                "skipped, loss scale -> %.0f (%d skips "
+                                "total). If this repeats every few hundred "
+                                "steps, raise --scaler_growth_interval.",
+                                step, scaler.get_scale(), skipped_steps)
                 else:
                     optimizer.step()
-                scheduler(step + 1)
+                if stepped_ok:
+                    scheduler(step + 1)
                 optimizer.zero_grad(set_to_none=True)
                 stepped_this_round = True
 
@@ -521,6 +559,23 @@ def main() -> int:
         ce_mean = sum(micro_losses) / max(len(micro_losses), 1)
 
         if is_main and logger and step % args.log_interval == 0:
+            # ---- spike detector: compare against a slow EMA of the CE ----
+            prev_ema = ema_ce
+            ema_ce = ce_mean if math.isnan(ema_ce) else 0.9 * ema_ce + 0.1 * ce_mean
+            if not math.isnan(prev_ema) and ce_mean > prev_ema + 0.75:
+                log.warning(
+                    "loss spike @step %d: ce=%.3f (ema=%.3f) | "
+                    "grad_norm=%.2f | router_entropy=%.3f | "
+                    "aux=%.4f z=%.4f%s -- a single spike that recovers by "
+                    "itself is usually one hard batch; recurring spikes "
+                    "with grad_norm near clip mean fp16 scale churn.",
+                    step, ce_mean, prev_ema, grad_norm,
+                    float(getattr(raw.recurrent_stack[0].moe,
+                                  "last_router_entropy", 0.0) or 0.0),
+                    last_info.get("aux", 0.0), last_info.get("z", 0.0),
+                    f" | loss_scale={scaler.get_scale():.0f}"
+                    if use_scaler else "",
+                )
             mfu_est = (
                 3.0 * flops_fwd * tokens_per_sec
                 / (peak_tflops * 1e12 * max(dist.world_size, 1))
@@ -528,13 +583,19 @@ def main() -> int:
             payload = {
                 "loss/ce": ce_mean,
                 "loss/ce_last": micro_losses[-1] if micro_losses else ce_mean,
+                "loss/aux": last_info.get("aux", 0.0),
+                "loss/z": last_info.get("z", 0.0),
                 "train/lr": lr_now,
+                "train/grad_norm": grad_norm,
+                "train/skipped_steps": skipped_steps,
                 "throughput/tokens_per_s": tokens_per_sec,
                 "mfu/estimate": mfu_est,
                 "moe/router_entropy": getattr(
                     raw.recurrent_stack[0].moe, "last_router_entropy", 0.0
                 ),
             }
+            if use_scaler:
+                payload["train/loss_scale"] = scaler.get_scale()
             logger.log(payload, step=step)
 
         should_eval = (
