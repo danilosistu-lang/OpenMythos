@@ -72,6 +72,7 @@ class MythosConfig:
     num_shared_experts: int = 1            # always-on experts (unconditional)
     top_k_experts: int = 2                 # routed experts activated per token
     aux_loss_coeff: float = 0.01           # load-balancing auxiliary loss weight
+    z_loss_coeff: float = 1e-3             # router logit-magnitude (ST-MoE z) penalty
 
     # ------------------------------------------------------------------- FFN
     ffn_multiplier: float = 8.0 / 3.0      # SwiGLU width heuristic multiplier
