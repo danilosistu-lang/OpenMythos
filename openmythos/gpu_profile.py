@@ -289,7 +289,10 @@ _GPU_DB_SORTED = sorted(GPU_DB, key=lambda e: -len(e["name"]))
 #   compile_mode   torch.compile mode that pays off on this silicon:
 #                  "reduce-overhead" (CUDA graphs -- small-model launch-bound
 #                  wins), "max-autotune" (deep GEMM pipelining on big dies),
-#                  "default", or None (don't compile).
+#                  "default", or None (don't compile).  NOTE 2026-08: CUDA-
+#                  graph modes are downgraded at build time (see the compile
+#                  guard in build_profile) - cudagraph_trees crashes on this
+#                  model's MoE host-sync graph breaks.
 #   sdpa_order     attention kernel priority for SDPA backend gating.
 #   env            per-architecture allocator/NCCL/cuBLAS environment knobs.
 #   data_feed      dataloader pacing that keeps this host class fed without
@@ -344,9 +347,9 @@ _TUNE_DB: Dict[str, Dict[str, Any]] = {
         kernel_eff=0.42, precision_pref=["fp16"], compile_mode="reduce-overhead",
         data_feed=dict(workers=4, chunk_docs=600, pause_s=0.5),
         ra="40 SM at a 70 W cap and only 320 GB/s: bandwidth-starved and "
-           "launch-bound on small models. fp16 TCs mandatory; CUDA graphs "
-           "(reduce-overhead) cut per-kernel launch cost, which is where "
-           "recurrent-depth loops lose most of their MFU."),
+           "launch-bound on small models. fp16 TCs mandatory; inductor "
+           "kernel fusion (default mode) is the lever - CUDA graphs are "
+           "OFF (cudagraph_trees crashes on the MoE graph breaks)."),
     "RTX 2080 Ti": dict(
         kernel_eff=0.50, precision_pref=["fp16"], compile_mode="reduce-overhead",
         data_feed=dict(workers=4, chunk_docs=600, pause_s=0.5),
@@ -868,6 +871,7 @@ _MFU_TARGET_DEFAULT = 0.30
 _FWD_TOK = {"100m": 0.30e9, "300m": 0.52e9, "500m": 0.73e9, "1b": 1.75e9,
             "3b": 4.0e9, "7b": 8.8e9, "10b": 11.5e9}
 _COMPILE_GAIN = {"max-autotune": 1.10, "reduce-overhead": 1.18,
+                 "max-autotune-no-cudagraphs": 1.09,
                  "default": 1.04, None: 1.0}
 #: Fixed multiplier for framework overheads the per-GPU model does not
 #: otherwise capture: MoE dispatch/combine kernels, recurrent-loop launch
@@ -1211,9 +1215,8 @@ def build_profile(det: Detection, variant: str = "500m",
             pass
 
     # ------------------------------------------------------------ compile
-    # Per-card mode: reduce-overhead (CUDA graphs) on launch-bound consumer
-    # dies, max-autotune on wide datacenter GEMMs, off where buffers cost
-    # more than kernels.
+    # Per-card mode: max-autotune on wide datacenter GEMMs, default elsewhere,
+    # off where buffers cost more than kernels.
     compile_mode = tune.get("compile_mode")
     if compile_mode is None and fam["compile"]:
         compile_mode = ("max-autotune"
@@ -1223,6 +1226,23 @@ def build_profile(det: Detection, variant: str = "500m",
         compile_mode = None
         notes.append("Small VRAM: torch.compile's extra graph buffers "
                      "outweigh its speedup - left off.")
+    if compile_mode == "reduce-overhead":
+        # CUDA-graph trees guard (real 2x T4 crash, 2026-08): the MoE dispatch
+        # loop host-syncs (boundaries.tolist(), moe.py) inside the compiled
+        # region, dynamo splits the graph, and cudagraph_trees' checkpoint-
+        # pool restore across segments raises "Expected curr_block->next ==
+        # nullptr" from the caching allocator at step 1.  "default" keeps
+        # the inductor kernel fusion without CUDA graphs.
+        compile_mode = "default"
+        notes.append("compile reduce-overhead downgraded to default: CUDA "
+                     "graph trees crash on this model's MoE graph breaks "
+                     "(torch allocator bug).")
+    elif compile_mode == "max-autotune":
+        # max-autotune enables cudagraphs via the same cudagraph_trees path
+        # - keep the GEMM autotuning, drop the graphs.
+        compile_mode = "max-autotune-no-cudagraphs"
+        notes.append("compile max-autotune downgraded to max-autotune-no-"
+                     "cudagraphs (same CUDA graph trees hazard).")
 
     peaks = entry["peaks"]
     mfu_key = {"fp32": "tf32" if fam["tf32"] else "fp32",
@@ -1583,6 +1603,7 @@ def self_test(verbose: bool = True) -> Tuple[int, int]:
             and int(tune["data_feed"]["chunk_docs"]) >= 30
             and float(tune["data_feed"]["pause_s"]) >= 0.0
             and tune.get("compile_mode") in ("max-autotune",
+                                             "max-autotune-no-cudagraphs",
                                              "reduce-overhead", "default",
                                              None)
             and tune.get("ckpt_bias") in ("auto", "on", "off")
@@ -1656,9 +1677,10 @@ def self_test(verbose: bool = True) -> Tuple[int, int]:
           prof["mfu"]["meets_target"])
     prof = detect_and_build_profile(simulate="RTX 4090", variant="500m",
                                     probe_pkgs=False)
-    check("4090 500m: seeker uses --compile (per-card max-autotune)",
+    check("4090 500m: seeker uses --compile (per-card max-autotune, "
+          "graphs stripped)",
           prof["settings"]["compile"]
-          and prof["settings"]["compile_mode"] == "max-autotune")
+          and prof["settings"]["compile_mode"] == "max-autotune-no-cudagraphs")
     prof = detect_and_build_profile(simulate="T4", variant="100m",
                                     probe_pkgs=False, mfu_target=0.50)
     check("T4 with 50% target: honest GAP (target respected, not faked)",
